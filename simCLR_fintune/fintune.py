@@ -5,7 +5,6 @@ import torchvision.transforms as T
 from torch.utils.data.sampler import BatchSampler
 from torch.utils.data import TensorDataset
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from simCLR_train_image_embedding.train import ImageEmbeddingModule
 import xml.etree.ElementTree as ET
 from glob import glob
 import os
@@ -48,6 +47,130 @@ cifa100_data = CIFAR100(root="./dataset", download=True,
                                 T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ]))
 
+
+class ImageEmbedding(nn.Module):
+    class Identity(nn.Module):
+        def __init__(self): super().__init__()
+
+        def forward(self, x):
+            return x
+
+    def __init__(self, embedding_size=1024):
+        super().__init__()
+
+        base_model = torchvision.models.resnet18(weights='IMAGENET1K_V1')
+        internal_embedding_size = base_model.fc.in_features
+        base_model.fc = ImageEmbedding.Identity()
+
+        self.embedding = base_model
+
+        self.projection = nn.Sequential(
+            nn.Linear(in_features=internal_embedding_size, out_features=embedding_size),
+            nn.ReLU(),
+            nn.Linear(in_features=embedding_size, out_features=embedding_size)
+        )
+
+    def calculate_embedding(self, image):
+        return self.embedding(image)
+
+    def forward(self, X):
+        image = X
+        embedding = self.calculate_embedding(image)
+        projection = self.projection(embedding)
+        return embedding, projection
+
+
+class ContrastiveLoss(nn.Module):
+    def __init__(self, batch_size, temperature=0.5):
+        super().__init__()
+        self.batch_size = batch_size
+        self.register_buffer("temperature", torch.tensor(temperature))
+        self.register_buffer("negatives_mask", (~torch.eye(batch_size * 2, batch_size * 2, dtype=bool)).float())
+
+    def forward(self, emb_i, emb_j):
+        """
+        emb_i and emb_j are batches of embeddings, where corresponding indices are pairs
+        z_i, z_j as per SimCLR paper
+        """
+        z_i = F.normalize(emb_i, dim=1)
+        z_j = F.normalize(emb_j, dim=1)
+
+        representations = torch.cat([z_i, z_j], dim=0)
+        similarity_matrix = F.cosine_similarity(representations.unsqueeze(1), representations.unsqueeze(0), dim=2)
+
+        sim_ij = torch.diag(similarity_matrix, self.batch_size)
+        sim_ji = torch.diag(similarity_matrix, -self.batch_size)
+        positives = torch.cat([sim_ij, sim_ji], dim=0)
+
+        nominator = torch.exp(positives / self.temperature)
+        denominator = self.negatives_mask * torch.exp(similarity_matrix / self.temperature)
+
+        loss_partial = -torch.log(nominator / torch.sum(denominator, dim=1))
+        loss = torch.sum(loss_partial) / (2 * self.batch_size)
+        return loss
+
+
+
+class ImageEmbeddingModule(pl.LightningModule):
+    def __init__(self, hparams):
+        # hparams = Namespace(**hparams) if isinstance(hparams, dict) else hparams
+        super().__init__()
+        self.save_hyperparameters(hparams)
+        # self.hparams = hparams
+        self.model = ImageEmbedding()
+        self.loss = ContrastiveLoss(self.hparams.batch_size)
+
+    def total_steps(self):
+        return len(self.train_dataloader()) // self.hparams.epochs
+
+    def train_dataloader(self):
+        return DataLoader(PretrainingDatasetWrapper(cifar10_unlabeled,
+                                                    debug=getattr(self.hparams, "debug", False)),
+                          batch_size=self.hparams.batch_size,
+                          num_workers=cpu_count(),
+                          sampler=SubsetRandomSampler(list(range(hparams.train_size))),
+                          drop_last=True)
+
+    def val_dataloader(self):
+        return DataLoader(PretrainingDatasetWrapper(cifar10_unlabeled,
+                                                    debug=getattr(self.hparams, "debug", False)),
+                          batch_size=self.hparams.batch_size,
+                          shuffle=False,
+                          num_workers=cpu_count(),
+                          sampler=SequentialSampler(
+                              list(range(hparams.train_size + 1, hparams.train_size + hparams.validation_size))),
+                          drop_last=True)
+
+    def forward(self, X):
+        return self.model(X)
+
+    def step(self, batch, step_name="train"):
+        (X, Y), y = batch
+        embX, projectionX = self.forward(X)
+        embY, projectionY = self.forward(Y)
+        loss = self.loss(projectionX, projectionY)
+        loss_key = f"{step_name}_loss"
+        tensorboard_logs = {loss_key: loss}
+
+        return {("loss" if step_name == "train" else loss_key): loss, 'log': tensorboard_logs,
+                "progress_bar": {loss_key: loss}}
+
+    def training_step(self, batch, batch_idx):
+        return self.step(batch, "train")
+
+    def validation_step(self, batch, batch_idx):
+        return self.step(batch, "val")
+
+    def validation_end(self, outputs):
+        if len(outputs) == 0:
+            return {"val_loss": torch.tensor(0)}
+        else:
+            loss = torch.stack([x["val_loss"] for x in outputs]).mean()
+            return {"val_loss": loss, "log": {"val_loss": loss}}
+
+    def configure_optimizers(self):
+        optimizer = RMSprop(self.model.parameters(), lr=self.hparams.lr)
+        return [optimizer], []
 
 class BalancedBatchSampler(BatchSampler):
     """
